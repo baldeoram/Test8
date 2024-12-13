@@ -1,0 +1,204 @@
+name: Build Unit-Test SonarScan
+on:
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - edited
+      - synchronize
+      - ready_for_review
+    branches:
+      - develop
+      - UAT
+      - release/*
+      - main
+      - baba
+      
+  push:
+    branches:
+      - 'feature/*'
+      - 'bugfix/*'
+  workflow_dispatch:
+
+env:
+  CI_COMMIT_AUTHOR: github-actions[bot]
+  CI_COMMIT_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Shallow clones should be disabled for a better relevancy of analysis
+
+      - name: Check Build type mvn vs npm
+        id: check-build-type
+        run: |
+          POM_FILE_PATH=./pom.xml
+          PACKAGE_JSON_PATH=./package.json
+          
+          if [ -f "$POM_FILE_PATH" ]; then
+            echo "pom.xml exists. Hence it is of type mvn build"
+            BUILD_TYPE=mvn
+            PROJECT_NAME=$(mvn help:evaluate -Dexpression=project.artifactId -q -DforceStdout)
+            PROJECT_VERSION=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
+          elif [ -f "$PACKAGE_JSON_PATH" ]; then
+            echo "package.json exists. Hence it is of type npm build"
+            BUILD_TYPE=npm
+            PROJECT_VERSION=$(jq -r '.version' $PACKAGE_JSON_PATH)
+          else 
+            echo "Neither $POM_FILE_PATH nor $PACKAGE_JSON_PATH exist."
+          fi
+          
+          echo "build-type=$BUILD_TYPE" >> $GITHUB_OUTPUT
+          echo "PROJECT_NAME: $PROJECT_NAME"
+          echo "projectName=$PROJECT_NAME" >> $GITHUB_OUTPUT
+          echo "PROJECT_VERSION: $PROJECT_VERSION"
+          echo "PROJECT_VERSION=$PROJECT_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Set up Amazon Corretto
+        if: ${{ steps.check-build-type.outputs.build-type == 'mvn' }}
+        run: |
+          POM_FILE="pom.xml"
+          JAVA_VERSION_NUMBER=$(sed -n 's:.*<java.version>\(.*\)</java.version>.*:\1:p' "$POM_FILE")
+          if [ -z "$JAVA_VERSION_NUMBER" ]; then JAVA_VERSION_NUMBER=$(sed -n 's:.*<maven.compiler.source>\(.*\)</maven.compiler.source>.*:\1:p' "$POM_FILE");fi
+          if [ -z "$JAVA_VERSION_NUMBER" ]; then echo "No version found in pom.xml, defaulting to 8"; JAVA_VERSION_NUMBER="1.8"; fi
+          if [ "$JAVA_VERSION_NUMBER" == "1.8" ]; then JAVA_VERSION_NUMBER="8"; fi
+          echo $JAVA_VERSION_NUMBER         
+          mkdir -p $HOME/amazon-corretto
+          wget -q -O $HOME/amazon-corretto/corretto-$JAVA_VERSION_NUMBER.tar.gz https://corretto.aws/downloads/latest/amazon-corretto-$JAVA_VERSION_NUMBER-x64-linux-jdk.tar.gz
+          tar -xf $HOME/amazon-corretto/corretto-$JAVA_VERSION_NUMBER.tar.gz -C $HOME/amazon-corretto
+          cd $HOME/amazon-corretto/
+          mv -i amazon-corretto* amazon-corretto-$JAVA_VERSION_NUMBER
+          echo "JAVA_HOME=$HOME/amazon-corretto/amazon-corretto-$JAVA_VERSION_NUMBER" >> $GITHUB_ENV
+          echo "PATH=$HOME/amazon-corretto/amazon-corretto-$JAVA_VERSION_NUMBER/bin:$PATH" >> $GITHUB_ENV
+
+      - name: Check Java Version
+        if: ${{ steps.check-build-type.outputs.build-type == 'mvn' }}
+        run: |
+          java -version
+
+      - name: Set up Maven
+        if: ${{ steps.check-build-type.outputs.build-type == 'mvn' }}
+        uses: stCarolas/setup-maven@v4.5
+        with:
+          maven-version: 3.8.2
+
+      - name: 'check maven version'
+        if: ${{ steps.check-build-type.outputs.build-type == 'mvn' }}
+        run: mvn -v
+
+      - name: Set up Node.js
+        if: ${{ steps.check-build-type.outputs.build-type == 'npm' }}
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'  # Use the required Node.js version for your project
+          cache: 'npm'
+
+      - name: npm Install dependencies
+        if: ${{ steps.check-build-type.outputs.build-type == 'npm' }}
+        run: npm install 
+
+      - name: Build Angular project
+        if: ${{ steps.check-build-type.outputs.build-type == 'npm' }}
+        run: npm run build-development 
+
+      - name: Upload build artifacts
+        if: ${{ steps.check-build-type.outputs.build-type == 'npm' }}
+        uses: actions/upload-artifact@v3
+        with:
+          name: build-artifacts
+          path: ./dist/
+
+      - name: Build and analyze UI code
+        if: ${{ steps.check-build-type.outputs.build-type == 'npm' }}
+        uses: sonarsource/sonarqube-scan-action@master
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+      
+      # If you wish to fail your job when the Quality Gate is red, uncomment the
+      # following lines. This would typically be used to fail a deployment.
+      # - uses: sonarsource/sonarqube-quality-gate-action@master
+      #   if: ${{ steps.check-build-type.outputs.build-type == 'npm' }}
+      #   timeout-minutes: 30
+      #   env:
+      #      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+      - name: Unit and Integration Test mvn
+        if: ${{ steps.check-build-type.outputs.build-type == 'mvn' }}
+        run: mvn verify
+        #--settings ./settings.xml "-Dmaven.test.skip=true"
+        
+      - name: Cache SonarQube packages
+        if: ${{ steps.check-build-type.outputs.build-type == 'mvn' }}
+        uses: actions/cache@v1
+        with:
+          path: ~/.sonar/cache
+          key: ${{ runner.os }}-sonar
+          restore-keys: ${{ runner.os }}-sonar
+      
+      - name: Cache Maven packages
+        if: ${{ steps.check-build-type.outputs.build-type == 'mvn' }}
+        uses: actions/cache@v1
+        with:
+          path: ~/.m2
+          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+          restore-keys: ${{ runner.os }}-m2
+      
+      - name: Build and analyze mvn codebase
+        if: ${{ steps.check-build-type.outputs.build-type == 'mvn' }}
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        run: mvn -B verify org.sonarsource.scanner.maven:sonar-maven-plugin:sonar -Dsonar.qualitygate.wait=true -Dsonar.projectKey=${{ steps.check-build-type.outputs.projectName }}
+        # -Dsonar.projectName='CIMS-application'
+        
+      #Below steps are for generating tag in case of commit to feature/bugfix branches
+      #commit at 07:37 in feature branch
+      - name: Set up Git
+        if: ${{ github.event_name == 'push' }}
+        run: |
+          git config --global user.name "${{ env.CI_COMMIT_AUTHOR }}"
+          #If you want to see the commits as if they came from the GitHub bot including its special annotation, then have a look at this checkout action pull request. https://github.com/actions/checkout/pull/1184 
+          git config --global user.email "${{ env.CI_COMMIT_EMAIL }}"
+          
+      - name: Derive Tag name for feature branch
+        if: ${{ github.event_name == 'push' }}
+        id: set-tag
+        run: |
+          echo "PROJECT_VERSION: ${{ steps.check-build-type.outputs.PROJECT_VERSION }}"
+          current_time=$(date +'%Y%b%d-%H.%M.%S.%3N')
+          #branch_name=${{ github.ref_name }}
+          #echo "branch_name: $branch_name"
+          branch_type=$(echo ${{ github.ref_name }} | cut -d '/' -f 1)
+          echo "branch_type: $branch_type"
+          branch_name=$(echo ${{ github.ref_name }} | cut -d '/' -f 2)
+          echo "branch_name: $branch_name"
+          NEW_TAG_VERSION=$(echo ${{ steps.check-build-type.outputs.PROJECT_VERSION }} | cut -d '.' -f 1).$(echo ${{ steps.check-build-type.outputs.PROJECT_VERSION }} | cut -d '.' -f 2)-$branch_type-$branch_name.$current_time
+          echo "NEW_TAG_VERSION: $NEW_TAG_VERSION"
+          echo "tag_name=v$NEW_TAG_VERSION" >> $GITHUB_OUTPUT
+                 
+      - name: Create Tag with Tag name
+        if: ${{ github.event_name == 'push' }}
+        uses: actions/github-script@v3
+        env:
+          TAG: ${{ steps.set-tag.outputs.tag_name }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            github.git.createRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+             ref: "refs/tags/${{ steps.set-tag.outputs.tag_name }}",
+              sha: context.sha
+            })
+
+
+        

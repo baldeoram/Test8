@@ -1,0 +1,159 @@
+name: Tag Creation for release branch
+on:
+  push:
+    branches:
+      - 'release/*'
+      - '!release/*-patch'
+  workflow_dispatch:
+
+env:
+  CI_COMMIT_AUTHOR: github-actions[bot]
+  CI_COMMIT_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+
+jobs:
+  CreateTag:
+    runs-on: ubuntu-latest
+    #permissions: write-all
+    permissions:
+      id-token: write
+      contents: write
+
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        
+      - name: Check Build type mvn vs npm
+        id: check-build-type
+        run: |
+          POM_FILE_PATH=./pom.xml
+          PACKAGE_JSON_PATH=./package.json
+          
+          if [ -f "$POM_FILE_PATH" ]; then
+            echo "pom.xml exists. Hence it is of type mvn build"
+            BUILD_TYPE=mvn
+            PROJECT_VERSION=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
+          elif [ -f "$PACKAGE_JSON_PATH" ]; then
+            echo "package.json exists. Hence it is of type npm build"
+            BUILD_TYPE=npm
+            PROJECT_VERSION=$(jq -r '.version' $PACKAGE_JSON_PATH)
+          else 
+            echo "Neither $POM_FILE_PATH nor $PACKAGE_JSON_PATH exist."
+          fi
+          
+          echo "build-type=$BUILD_TYPE" >> $GITHUB_OUTPUT
+          echo "PROJECT_VERSION: $PROJECT_VERSION"
+          echo "PROJECT_VERSION=$PROJECT_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Set up Maven
+        if: ${{ steps.check-build-type.outputs.build-type == 'mvn' }}
+        uses: stCarolas/setup-maven@v4.5
+        with:
+          maven-version: 3.8.2
+
+      - name: 'check maven version'
+        if: ${{ steps.check-build-type.outputs.build-type == 'mvn' }}
+        run: mvn -v
+          
+      - name: Set up Git
+        run: |
+          git config --global user.name "${{ env.CI_COMMIT_AUTHOR }}"
+          #If you want to see the commits as if they came from the GitHub bot including its special annotation, then have a look at this checkout action pull request. https://github.com/actions/checkout/pull/1184 
+          git config --global user.email "${{ env.CI_COMMIT_EMAIL }}"
+          
+      #Pattern v<#>.<#>-rc1.<*> and v<#>.<#>-rc1.latest Example: v0.5-rc1.4 and v0.5-rc1.latest
+      - name: Derive and validate Tag
+        id: set-tag
+        run: |
+          echo "PROJECT_VERSION: ${{ steps.check-build-type.outputs.PROJECT_VERSION }}"
+          
+          PROJECT_MAJOR_VERSION=$(echo ${{ steps.check-build-type.outputs.PROJECT_VERSION }} | cut -d '.' -f 1)
+          PROJECT_MINOR_VERSION=$(echo ${{ steps.check-build-type.outputs.PROJECT_VERSION }} | cut -d '.' -f 2)
+          
+          echo "Fetch Tags with prune"
+          git fetch --tags --prune --prune-tags
+          
+          echo "Tag List:"
+          git tag --list
+          
+          NOT_FOUND=NOT_FOUND
+          EXISTING_LATEST_TAG_NAME=$(git tag --list | grep -E "v[0-9]{1,2}.[0-9]{1,2}-rc1.latest$" || echo $NOT_FOUND)
+          echo "EXISTING_LATEST_TAG_NAME: $EXISTING_LATEST_TAG_NAME"
+          
+          if [[ $EXISTING_LATEST_TAG_NAME != $NOT_FOUND ]]
+          then
+            echo "existing_latest_tag_name=$EXISTING_LATEST_TAG_NAME" >> $GITHUB_OUTPUT
+          
+            COMMIT_ID_OF_LATEST=$(git show $EXISTING_LATEST_TAG_NAME --no-patch --no-notes --pretty=%H)
+            CURRENT_TAG_VERSION=$(git tag --contains $COMMIT_ID_OF_LATEST | grep -v latest | grep -E "v[0-9]{1,2}.[0-9]{1,2}-rc1.[0-9]")
+            echo "CURRENT_TAG_VERSION: $CURRENT_TAG_VERSION"
+            
+            CURRENT_TAG_MAJOR_VERSION_V=$(echo ${CURRENT_TAG_VERSION} | cut -d '.' -f 1)
+            CURRENT_TAG_MAJOR_VERSION=${CURRENT_TAG_MAJOR_VERSION_V:1}
+            echo "CURRENT_TAG_MAJOR_VERSION: $CURRENT_TAG_MAJOR_VERSION"
+            CURRENT_TAG_MINOR_VERSION=$(echo $(echo ${CURRENT_TAG_VERSION} | cut -d '.' -f 2) | cut -d '-' -f 1)
+            CURRENT_TAG_PATCH_VERSION=$(echo ${CURRENT_TAG_VERSION} | cut -d '.' -f 3)
+            
+            NEW_TAG_PATCH_VERSION=$(($CURRENT_TAG_PATCH_VERSION + 1))
+            
+            if [ "$PROJECT_MAJOR_VERSION" -gt "$CURRENT_TAG_MAJOR_VERSION" ]; then
+              echo "PROJECT_MAJOR_VERSION is higher than CURRENT_TAG_MAJOR_VERSION. Hence resetting the patch version to 0"
+              NEW_TAG_PATCH_VERSION=0
+            elif [ "$PROJECT_MAJOR_VERSION" -eq "$CURRENT_TAG_MAJOR_VERSION" ]; then
+              echo "PROJECT_MAJOR_VERSION is same as CURRENT_TAG_MAJOR_VERSION. Hence doing minor version comparision"
+              if [ "$PROJECT_MINOR_VERSION" -gt "$CURRENT_TAG_MINOR_VERSION" ]; then
+                echo "PROJECT_MINOR_VERSION is higher than CURRENT_TAG_MINOR_VERSION. Hence resetting the patch version to 0"
+                NEW_TAG_PATCH_VERSION=0
+              fi
+            else
+              echo "Continue with patch version increment"
+            fi
+            
+          else
+            echo "CURRENT_TAG_VERSION is empty"
+            NEW_TAG_PATCH_VERSION=0
+            
+          fi
+          
+          PROJECT_MAJOR_MINOR_VERSION=${PROJECT_MAJOR_VERSION}.${PROJECT_MINOR_VERSION}
+          NEW_TAG_VERSION=v${PROJECT_MAJOR_MINOR_VERSION}-rc1.${NEW_TAG_PATCH_VERSION}
+          echo "NEW_TAG_VERSION: $NEW_TAG_VERSION"
+          echo "tag_name=$NEW_TAG_VERSION" >> $GITHUB_OUTPUT
+          
+          LATEST_TAG_NAME=v${PROJECT_MAJOR_MINOR_VERSION}-rc1.latest
+          echo "LATEST_TAG_NAME: $LATEST_TAG_NAME"
+          echo "latest_tag_name=$LATEST_TAG_NAME" >> $GITHUB_OUTPUT
+
+      - name: Delete existing latest tag
+        run: |
+          if [ -n "${{ steps.set-tag.outputs.existing_latest_tag_name }}" ]; then
+            git push origin --delete ${{ steps.set-tag.outputs.existing_latest_tag_name }}
+          fi
+
+      - name: Create Tag with Tag name
+        uses: actions/github-script@v3
+        env:
+          TAG: ${{ steps.set-tag.outputs.tag_name }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            github.git.createRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: "refs/tags/${{ steps.set-tag.outputs.tag_name }}",
+              sha: context.sha
+            })
+
+      - name: Re-Create same Tag as latest
+        uses: actions/github-script@v3
+        env:
+          TAG: ${{ steps.set-tag.outputs.latest_tag_name }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            github.git.createRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: "refs/tags/${{ steps.set-tag.outputs.latest_tag_name }}",
+              sha: context.sha
+            })
+
